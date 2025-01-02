@@ -1,62 +1,55 @@
 import os
 import pandas as pd
-from transformers import pipeline
-from langchain_core.tools import tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.schema import BaseLLM  # LangChain-compatible base class
+import streamlit as st
+from llama_index.llms.ollama import Ollama
+from llama_index.core.agent import ReActAgent
+from llama_index.core.tools import FunctionTool
 
-# Define a LangChain-compatible LLM wrapper
-class HuggingFaceLLM(BaseLLM):
-    def __init__(self, pipeline_func):
-        self.pipeline = pipeline_func
-
-    def _call(self, prompt: str, stop=None):
-        """Required method for LangChain LLMs to handle text generation."""
-        result = self.pipeline(prompt, max_length=150, min_length=40, do_sample=False)
-        return result[0]["summary_text"]
-
-    @property
-    def _llm_type(self):
-        """Return type of LLM."""
-        return "custom_huggingface"
-
-# Load the Hugging Face summarization pipeline
-summarizer_pipeline = pipeline("summarization", model="facebook/bart-large-cnn")
-
-# Initialize the LangChain-compatible LLM
-llm = HuggingFaceLLM(summarizer_pipeline)
-
-# Define the cashflow tool
-@tool
+# Function to read cash flow data
 def invokecashflow():
-    """Fetches and summarizes cashflow information from an Excel sheet."""
-    print("Inside Cashflow Tool")
-    file_path = "C://Users//rangesh//Documents//CashFlow.xlsx"
-    
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Excel file not found at {file_path}")
+    """
+    Extracts cash flow information from a predefined Excel file.
+    The Excel file should have a sheet named 'CashFlow'.
+    """
+    try:
+        file_path = "C://Users//rangesh//Documents//CashFlow.xlsx"
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        st.info("Reading Cashflow data from Excel...")
+        data = pd.read_excel(file_path, sheet_name="CashFlow")
+        return data.to_string()
+    except Exception as e:
+        return f"Error while reading CashFlow data: {str(e)}"
 
-    data = pd.read_excel(file_path, sheet_name="CashFlow")
-    return data.to_string()
+# Initialize the FunctionTool
+cashflow_tool = FunctionTool.from_defaults(fn=invokecashflow)
 
-# Define the tools
-tools = [invokecashflow]
-
-# Define the prompt template
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", "You are a helpful Cashflow assistant. Do the needful with respect to cashflow/finance statements or queries i.e utilize tools to make decisions. Tools that you own are specific to Verizon Information."),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ]
+# Configure the LLM model
+llm = Ollama(
+    model="hf.co/bullerwins/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M", 
+    request_timeout=180.0
 )
 
-# Create the LangChain agent
-agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools)
+# Create the ReActAgent
+agent = ReActAgent.from_tools([cashflow_tool], llm=llm, verbose=True)
 
-# Query and get a response
-query = "Can you summarize the cashflow statement for Verizon?"
-res = agent_executor.invoke({"input": query})
-print(res['output'])
+# Streamlit Application
+st.title("Interactive Cash Flow Analysis with LLM")
+
+# User Input
+user_query = st.text_input("Ask a question about the cash flow data:")
+
+if user_query:
+    with st.spinner("Processing your request..."):
+        response = agent.chat(user_query)
+    st.success("Response received!")
+    st.write(response)
+
+# Display Cash Flow Data (Optional)
+if st.checkbox("Show Cash Flow Data"):
+    try:
+        df = pd.read_excel("C://Users//rangesh//Documents//CashFlow.xlsx", sheet_name="CashFlow")
+        st.dataframe(df)
+    except Exception as e:
+        st.error(f"Error loading cash flow data: {str(e)}")
