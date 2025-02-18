@@ -1,0 +1,158 @@
+import os
+import psycopg2
+import redis
+import faiss
+import pickle
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from celery import Celery
+from sentence_transformers import SentenceTransformer
+from datasketch import MinHash, MinHashLSH
+
+# Load environment variables
+load_dotenv()
+
+# PostgreSQL Configuration
+POSTGRES_DB = os.getenv("POSTGRES_DB")
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT")
+
+# Redis Configuration
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+# Hugging Face Embedding Model
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# Redis Cache Client
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+
+# FAISS Index for Vector Storage
+dimension = 384  # Embedding size
+faiss_index = faiss.IndexFlatL2(dimension)
+doc_id_mapping = {}
+
+# MinHash LSH for Approximate Search
+lsh = MinHashLSH(threshold=0.8, num_perm=128)
+
+# Celery Configuration
+celery_app = Celery('tasks', broker=f'redis://{REDIS_HOST}:{REDIS_PORT}/0')
+
+# Connect to PostgreSQL
+def get_db_connection():
+    return psycopg2.connect(
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+    )
+
+# Fetch batch of records dynamically handling multiple columns
+def fetch_documents(batch_size=1000, offset=0):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM items ORDER BY id LIMIT %s OFFSET %s", (batch_size, offset))
+    records = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    
+    df = pd.DataFrame(records, columns=columns)
+    
+    conn.close()
+    return df
+
+# Generate Embeddings using Hugging Face Model
+def get_embedding(text):
+    return embedding_model.encode(text, convert_to_numpy=True)
+
+# Prepare text for embedding by concatenating relevant columns
+def prepare_text_for_embedding(row):
+    return " ".join(str(row[col]) for col in row.index if isinstance(row[col], str))
+
+# Store embedding in Redis cache
+def store_in_cache(query, embedding):
+    redis_client.set(query, pickle.dumps(embedding))
+
+# Retrieve embedding from Redis cache
+def get_from_cache(query):
+    cached_result = redis_client.get(query)
+    return pickle.loads(cached_result) if cached_result else None
+
+# Store embedding in FAISS
+def store_in_faiss(embedding, doc_id):
+    faiss_index.add_with_ids(np.array([embedding]), np.array([doc_id]))
+    doc_id_mapping[doc_id] = embedding
+
+# Search FAISS for relevant embeddings
+def search_faiss(query_embedding, top_k=5):
+    distances, indices = faiss_index.search(np.array([query_embedding]), top_k)
+    return indices[0]
+
+# Add Document to MinHash LSH
+def add_to_lsh(doc_id, text):
+    minhash = MinHash(num_perm=128)
+    for word in text.split():
+        minhash.update(word.encode('utf8'))
+    lsh.insert(doc_id, minhash)
+
+# Search in LSH
+def search_lsh(query):
+    minhash = MinHash(num_perm=128)
+    for word in query.split():
+        minhash.update(word.encode('utf8'))
+    return lsh.query(minhash)
+
+# Asynchronous task for embedding computation
+@celery_app.task
+def compute_embedding_task(text):
+    return get_embedding(text)
+
+# Query Processing Pipeline
+def process_query(query):
+    # 1. Check Redis Cache
+    cached_embedding = get_from_cache(query)
+    if cached_embedding:
+        return cached_embedding
+
+    # 2. Perform Approximate Search via MinHash LSH
+    similar_docs = search_lsh(query)
+    if similar_docs:
+        return [faiss_index.reconstruct(doc_id) for doc_id in similar_docs]
+
+    # 3. On-Demand Embedding Computation
+    embedding = compute_embedding_task.apply_async(args=[query]).get()
+
+    # 4. Store Results
+    store_in_cache(query, embedding)
+    return embedding
+
+# Main Execution
+if __name__ == "__main__":
+    print("Fetching data from PostgreSQL...")
+    offset = 0
+    batch_size = 1000
+    
+    while True:
+        df = fetch_documents(batch_size=batch_size, offset=offset)
+        if df.empty:
+            break
+        
+        print(f"Processing batch {offset} to {offset + batch_size}")
+        
+        for _, row in df.iterrows():
+            text = prepare_text_for_embedding(row)
+            embedding = get_embedding(text)
+            store_in_faiss(embedding, row['id'])
+            add_to_lsh(row['id'], text)
+
+        offset += batch_size
+
+    print("Data ingestion complete. Running query...")
+
+    query = "Find details about product XYZ"
+    embedding = process_query(query)
+    print("Query Embedding:", embedding)
