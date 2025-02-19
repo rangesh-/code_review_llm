@@ -1,142 +1,189 @@
 import os
 import psycopg2
-import numpy as np
 import redis
 import faiss
-import hashlib
-import minhash
-import ollama
+import pickle
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
 from celery import Celery
-from langchain.embeddings import OllamaEmbeddings
-from langchain.vectorstores import FAISS
-from sklearn.preprocessing import normalize
+from sentence_transformers import SentenceTransformer
+from datasketch import MinHash, MinHashLSH
+from contextlib import contextmanager
+import streamlit as st
 
-# ✅ PostgreSQL Configuration
-POSTGRES_DB = "rag_db"
+# Load environment variables
+load_dotenv()
+
+# PostgreSQL Configuration
+POSTGRES_DB = "DVDRENTAL"
 POSTGRES_USER = "postgres"
 POSTGRES_PASSWORD = "password"
 POSTGRES_HOST = "localhost"
-POSTGRES_PORT = "5432"
+POSTGRES_PORT = 5433
 
-# ✅ Redis Cache
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+# Redis Configuration
+REDIS_HOST ="localhost"
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-# ✅ Celery for Async Embedding Computation
-CELERY_BROKER_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
-CELERY_BACKEND = f"redis://{REDIS_HOST}/{REDIS_PORT}/1"
-celery_app = Celery("tasks", broker=CELERY_BROKER_URL, backend=CELERY_BACKEND)
+# Hugging Face Embedding Model
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-# ✅ FAISS Vector Index
-embedding_size = 4096  # Ollama Llama3 default embedding size
-index = faiss.IndexFlatL2(embedding_size)
+# Redis Cache Client with connection pooling
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
 
-# ✅ Ollama Llama3 Model
-ollama_model = Ollama(model="llama3")
+# FAISS Index for Vector Storage (Requires Numeric IDs)
+DIMENSION = 384  # Embedding size
+faiss_index = faiss.IndexFlatL2(DIMENSION)  # Base index
+faiss_index = faiss.IndexIDMap(faiss_index)  # Wrap with IndexIDMap to support custom IDs
 
-# ✅ PostgreSQL Connection
-def get_postgres_connection():
-    return psycopg2.connect(
+# String-to-Numeric ID Mapping
+doc_id_map = {}  # Maps string ID → Numeric FAISS ID
+reverse_doc_id_map = {}  # Reverse mapping for retrieval
+
+# MinHash LSH for Approximate Search
+LSH_THRESHOLD = 0.8
+LSH_NUM_PERM = 128
+lsh = MinHashLSH(threshold=LSH_THRESHOLD, num_perm=LSH_NUM_PERM)
+
+# Celery Configuration
+celery_app = Celery('tasks', broker=f'redis://{REDIS_HOST}:{REDIS_PORT}/0')
+
+# Context manager for PostgreSQL connections
+@contextmanager
+def get_db_connection():
+    conn = psycopg2.connect(
         dbname=POSTGRES_DB,
         user=POSTGRES_USER,
         password=POSTGRES_PASSWORD,
         host=POSTGRES_HOST,
         port=POSTGRES_PORT,
     )
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-# ✅ Generate Embeddings (Ollama Llama3)
-def generate_embedding(text):
-    response = ollama.embeddings(model="llama3", input=text)
-    return np.array(response["embedding"], dtype=np.float32)
+# Fetch batch of records dynamically handling multiple columns
+def fetch_documents(batch_size=1000, offset=0):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM film LIMIT %s OFFSET %s", (batch_size, offset))
+        records = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        return pd.DataFrame(records, columns=columns)
 
-# ✅ MinHash for Approximate Search
-def compute_minhash(text, num_hashes=128):
-    minhash_obj = minhash.MinHash(num_perm=num_hashes)
-    minhash_obj.update(text.encode("utf8"))
-    return minhash_obj.hashvalues
+# Generate Embeddings using Hugging Face Model
+def get_embedding(text):
+    return embedding_model.encode(text, convert_to_numpy=True)
 
-# ✅ Reinforcement Learning-Based Query Prioritization
-def rl_query_decision(query):
-    query_hash = hashlib.md5(query.encode()).hexdigest()
-    score = redis_client.get(f"rl_score:{query_hash}")
+# Prepare text for embedding by concatenating relevant columns
+def prepare_text_for_embedding(row):
+    return " ".join(str(row[col]) for col in row.index if isinstance(row[col], str))
 
-    if score is None:
-        return "APPROXIMATE_SEARCH"
+# Store embedding in Redis cache with TTL (Time-to-Live)
+def store_in_cache(query, embedding, ttl=3600):  # Default TTL: 1 hour
+    redis_client.set(query, pickle.dumps(embedding), ex=ttl)
 
-    score = float(score)
+# Retrieve embedding from Redis cache
+def get_from_cache(query):
+    cached_result = redis_client.get(query)
+    return pickle.loads(cached_result) if cached_result else None
 
-    if score > 0.8:
-        return "USE_CACHED_EMBEDDING"
-    elif score > 0.5:
-        return "APPROXIMATE_SEARCH"
-    else:
-        return "ON_DEMAND_EMBEDDING"
+# Store embedding in FAISS with a string ID mapping
+def store_in_faiss(embedding, doc_id):
+    numeric_id = len(doc_id_map) + 1  # Assign sequential numeric ID
+    doc_id_map[doc_id] = numeric_id
+    reverse_doc_id_map[numeric_id] = doc_id
+    faiss_index.add_with_ids(np.array([embedding], dtype=np.float32), np.array([numeric_id], dtype=np.int64))
 
-# ✅ Store Embedding in FAISS
-def store_embedding(text, doc_id):
-    embedding = generate_embedding(text)
-    index.add(np.array([embedding]))
-    redis_client.set(f"embedding:{doc_id}", embedding.tobytes())
+# Search FAISS for relevant embeddings
+def search_faiss(query_embedding, top_k=5):
+    distances, indices = faiss_index.search(np.array([query_embedding], dtype=np.float32), top_k)
+    return [reverse_doc_id_map.get(idx, None) for idx in indices[0] if idx in reverse_doc_id_map]
+
+# Add Document to MinHash LSH
+def add_to_lsh(doc_id, text):
+    minhash = MinHash(num_perm=LSH_NUM_PERM)
+    for word in text.split():
+        minhash.update(word.encode('utf8'))
+    lsh.insert(doc_id, minhash)
+
+# Search in LSH
+def search_lsh(query):
+    minhash = MinHash(num_perm=LSH_NUM_PERM)
+    for word in query.split():
+        minhash.update(word.encode('utf8'))
+    return lsh.query(minhash)
+
+# Asynchronous task for embedding computation
+@celery_app.task
+def compute_embedding_task(text):
+    return get_embedding(text)
+
+# Query Processing Pipeline
+def process_query(query):
+    # 1. Check Redis Cache
+    cached_embedding = get_from_cache(query)
+    if cached_embedding:
+        return cached_embedding
+
+    # 2. Perform Approximate Search via MinHash LSH
+    similar_docs = search_lsh(query)
+    if similar_docs:
+        return [faiss_index.reconstruct(doc_id_map[doc_id]) for doc_id in similar_docs if doc_id in doc_id_map]
+
+    # 3. On-Demand Embedding Computation
+    embedding = compute_embedding_task.apply_async(args=[query]).get()
+
+    # 4. Store Results
+    store_in_cache(query, embedding)
     return embedding
 
-# ✅ Retrieve Cached Embedding
-def get_cached_embedding(doc_id):
-    cached_embedding = redis_client.get(f"embedding:{doc_id}")
-    if cached_embedding:
-        return np.frombuffer(cached_embedding, dtype=np.float32)
-    return None
+# Streamlit App
+def main():
+    st.title("Hybrid Search System")
+    st.sidebar.header("Options")
 
-# ✅ Celery Task for On-Demand Embedding Computation
-@celery_app.task
-def compute_embedding_async(query, doc_id):
-    embedding = generate_embedding(query)
-    redis_client.set(f"embedding:{doc_id}", embedding.tobytes())
-    index.add(np.array([embedding]))
+    # Button to load data from the database
+    if st.sidebar.button("Load Data from Database"):
+        st.write("Loading data from PostgreSQL...")
+        offset = 0
+        batch_size = 1000
+        
+        while True:
+            df = fetch_documents(batch_size=batch_size, offset=offset)
+            if df.empty:
+                break
+            
+            st.write(f"Processing batch {offset} to {offset + batch_size}")
+            
+            for _, row in df.iterrows():
+                doc_id = str(row['title'])  # Ensure ID is a string
+                text = prepare_text_for_embedding(row)
+                embedding = get_embedding(text)
+                store_in_faiss(embedding, doc_id)
+                add_to_lsh(doc_id, text)
 
-# ✅ Batch Process Large Dataset from PostgreSQL
-def process_large_dataset(batch_size=10000):
-    conn = get_postgres_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, content FROM item")  # Table 'item' has 1M rows
+            offset += batch_size
 
-    while True:
-        rows = cur.fetchmany(batch_size)
-        if not rows:
-            break
-        for doc_id, text in rows:
-            store_embedding(text, doc_id)
+        st.success("Data ingestion complete!")
 
-    conn.close()
+    # Input for user query
+    query = st.text_input("Enter your query:")
+    if query:
+        st.write(f"Processing query: {query}")
+        embedding = process_query(query)
+        st.write("Query Embedding:", embedding)
 
-# ✅ Query Execution Pipeline
-def query_pipeline(query):
-    decision = rl_query_decision(query)
+        # Display similar documents
+        similar_docs = search_faiss(embedding)
+        if similar_docs:
+            st.subheader("Similar Documents:")
+            for doc_id in similar_docs:
+                st.write(f"Document ID: {doc_id}")
 
-    if decision == "USE_CACHED_EMBEDDING":
-        print("✅ Using Cached Embedding")
-        return get_cached_embedding(query)
-
-    elif decision == "APPROXIMATE_SEARCH":
-        print("🔍 Performing MinHash Approximate Search")
-        minhash_signature = compute_minhash(query)
-        # (Simulation: Return dummy nearest match)
-        return f"Approximate result for: {query}"
-
-    elif decision == "ON_DEMAND_EMBEDDING":
-        print("🚀 Triggering On-Demand Embedding Computation")
-        compute_embedding_async.delay(query, hashlib.md5(query.encode()).hexdigest())
-        return "Embedding computation in progress..."
-
-    return "No suitable retrieval strategy found."
-
-# ✅ Run End-to-End Pipeline
+# Run the Streamlit app
 if __name__ == "__main__":
-    process_large_dataset()  # Process large dataset in batches
-
-    print("\n🔍 Running Query Pipeline...")
-    query1 = "How does AI work?"
-    print(query_pipeline(query1))
-
-    print("\n🔍 Running Query Pipeline Again...")
-    print(query_pipeline(query1))  # Should now use stored embedding
+    main()
