@@ -1,0 +1,38 @@
+✅ Pros:
+✅ Faster queries (pre-deduplicated data)
+
+✅ Reduced index size (old versions removed)
+
+✅ Better for dashboards/APIs (low latency)
+
+✅ Scales better for large datasets
+
+✅ Can enrich or transform data during update
+
+❌ Cons:
+❌ Adds write load to the cluster
+
+❌ Requires orchestration (e.g., scheduled jobs)
+
+❌ Not real-time (updates processed after ingestion)
+
+❌ Risk of partial failures in long-running jobs
+
+📎 collapse at Query Time
+✅ Pros:
+✅ Always up-to-date (latest data returned)
+
+✅ No write overhead
+
+✅ Simple to implement
+
+✅ Great for exploratory or ad-hoc queries
+
+❌ Cons:
+❌ Slow queries (needs to scan + deduplicate)
+
+❌ High memory usage (especially with large datasets)
+
+❌ Doesn't reduce storage (all versions remain)
+
+❌ Poor scalability as index grows
